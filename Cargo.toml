@@ -1,0 +1,17 @@
+[package]
+name = "github-tui"
+version = "0.1.0"
+edition = "2024"
+description = "k9s-style terminal UI for GitHub issues and pull requests, backed by the gh CLI"
+repository = "https://github.com/generall/github-tui"
+
+[dependencies]
+anyhow = "1.0.104"
+crossterm = "0.29.0"
+dirs = "6.0.0"
+edtui = { version = "0.11.6", default-features = false, features = ["mouse-support"] }
+pulldown-cmark = "0.13.4"
+ratatui = "0.30.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
