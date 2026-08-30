@@ -388,11 +388,16 @@ fn draw_list(f: &mut Frame, app: &mut App, area: Rect) {
             .unwrap_or(6)
             .clamp(4, cap) as u16
     };
-    // number + title pinned, then as many scrolled columns as actually fit
+    // number + title pinned, then as many scrolled columns as actually fit;
+    // the title shrinks (to 30) before it starves the other columns
     let avail = area.width.saturating_sub(2);
+    let others: u16 = (2..COLUMNS.len()).map(|i| 2 + col_width(i)).sum();
+    let title_w = col_width(1)
+        .min(avail.saturating_sub(col_width(0) + 2 + others).max(30))
+        .min(avail.saturating_sub(col_width(0) + 2));
     let mut idx: Vec<usize> = vec![0, 1];
-    let mut used = col_width(0) + 2 + col_width(1).min(avail.saturating_sub(col_width(0) + 2));
-    let mut widths: Vec<Constraint> = vec![Constraint::Length(col_width(0)), Constraint::Length(used - col_width(0) - 2)];
+    let mut used = col_width(0) + 2 + title_w;
+    let mut widths: Vec<Constraint> = vec![Constraint::Length(col_width(0)), Constraint::Length(title_w)];
     for i in 2 + t.col_offset..COLUMNS.len() {
         let w = col_width(i);
         if used + 2 + w > avail {

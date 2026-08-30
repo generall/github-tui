@@ -2,6 +2,31 @@
 
 k9s-style terminal UI for GitHub issues and pull requests, backed by the [`gh` CLI](https://cli.github.com).
 
+![search palette](docs/search.png)
+
+<details>
+<summary>More screenshots</summary>
+
+Pull request page — markdown body with syntax-highlighted code, then the comments and reviews:
+
+![pull request page](docs/item.png)
+
+Issue / PR lists with view switching:
+
+![open PRs](docs/list.png)
+
+![view picker](docs/views.png)
+
+Metadata editor — labels multi-pick:
+
+![metadata editor](docs/meta.png)
+
+Repo picker:
+
+![repo picker](docs/repos.png)
+
+</details>
+
 - Launched inside a checkout it opens that repo automatically, and the PR of the
   checked-out branch on top if there is one. `R` switches repos (your repos, or any
   typed `owner/name`); `github-tui owner/repo`, `owner/repo#N` or `#N` jump straight there.
