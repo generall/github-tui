@@ -1,6 +1,6 @@
 [package]
 name = "github-tui"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "k9s-style terminal UI for GitHub issues and pull requests, backed by the gh CLI"
 repository = "https://github.com/generall/github-tui"

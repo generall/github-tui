@@ -38,6 +38,8 @@ pub struct ItemDoc {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Comment {
     pub author: String,
+    #[serde(default)]
+    pub is_bot: bool,
     pub date: String,
     /// empty for plain comments, review state (approved, …) for reviews
     pub kind: String,
@@ -498,9 +500,9 @@ fn login(v: &Value) -> String {
 }
 
 const ITEM_QUERY: &str = "query($owner:String!,$name:String!,$n:Int!){repository(owner:$owner,name:$name){issueOrPullRequest(number:$n){__typename \
-... on Issue{number title body state url createdAt updatedAt author{login} labels(first:50){nodes{name}} assignees(first:20){nodes{login}} milestone{title} comments(first:100){nodes{author{login} createdAt body}}} \
+... on Issue{number title body state url createdAt updatedAt author{login} labels(first:50){nodes{name}} assignees(first:20){nodes{login}} milestone{title} comments(first:100){nodes{author{login __typename} createdAt body}}} \
 ... on PullRequest{number title body state url createdAt updatedAt isDraft headRefName baseRefName reviewDecision author{login} labels(first:50){nodes{name}} assignees(first:20){nodes{login}} milestone{title} \
-reviewRequests(first:20){totalCount nodes{requestedReviewer{... on User{login} ... on Team{name}}}} reviews(first:50){nodes{author{login} state createdAt body}} comments(first:100){nodes{author{login} createdAt body}}}}}}";
+reviewRequests(first:20){totalCount nodes{requestedReviewer{... on User{login} ... on Team{name}}}} reviews(first:50){nodes{author{login __typename} state createdAt body}} comments(first:100){nodes{author{login __typename} createdAt body}}}}}}";
 
 fn fetch_item_sync(repo: &str, number: u64) -> Result<ItemDoc> {
     let (owner, name) = repo.split_once('/').ok_or_else(|| anyhow!("bad repo {repo}"))?;
@@ -515,6 +517,10 @@ fn fetch_item_sync(repo: &str, number: u64) -> Result<ItemDoc> {
         None,
     )?;
     let v: Value = serde_json::from_str(&out)?;
+    parse_item(&v, repo, number)
+}
+
+fn parse_item(v: &Value, repo: &str, number: u64) -> Result<ItemDoc> {
     let it = &v["data"]["repository"]["issueOrPullRequest"];
     if it.is_null() {
         return Err(anyhow!("{repo}#{number} not found"));
@@ -526,7 +532,10 @@ fn fetch_item_sync(repo: &str, number: u64) -> Result<ItemDoc> {
     for c in it["comments"]["nodes"].as_array().unwrap_or(&Vec::new()) {
         comments.push((
             c["createdAt"].as_str().unwrap_or("").into(),
-            Comment { author: login(&c["author"]), date: date(&c["createdAt"]), kind: String::new(), body: c["body"].as_str().unwrap_or("").into() },
+            Comment {
+                author: login(&c["author"]), is_bot: c["author"]["__typename"] == "Bot",
+                date: date(&c["createdAt"]), kind: String::new(), body: c["body"].as_str().unwrap_or("").into(),
+            },
         ));
     }
     for r in it["reviews"]["nodes"].as_array().unwrap_or(&Vec::new()) {
@@ -537,7 +546,10 @@ fn fetch_item_sync(repo: &str, number: u64) -> Result<ItemDoc> {
         }
         comments.push((
             r["createdAt"].as_str().unwrap_or("").into(),
-            Comment { author: login(&r["author"]), date: date(&r["createdAt"]), kind, body: body.into() },
+            Comment {
+                author: login(&r["author"]), is_bot: r["author"]["__typename"] == "Bot",
+                date: date(&r["createdAt"]), kind, body: body.into(),
+            },
         ));
     }
     comments.sort_by(|a, b| a.0.cmp(&b.0));
@@ -768,6 +780,36 @@ pub fn apply_field(doc: &mut ItemDoc, field: &str, value: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn comment_and_review_bot_identity_survives_cache_roundtrip() {
+        let response = serde_json::json!({"data": {"repository": {"issueOrPullRequest": {
+            "__typename": "PullRequest",
+            "comments": {"nodes": [
+                {"author": {"login": "review-app", "__typename": "Bot"}, "body": "Bot comment"},
+                {"author": {"login": "robotics-dev", "__typename": "User"}, "body": "Human comment"},
+                {"author": null, "body": "Deleted author"}
+            ]},
+            "reviews": {"nodes": [
+                {"author": {"login": "review-app", "__typename": "Bot"}, "body": "Bot review", "state": "CHANGES_REQUESTED"}
+            ]}
+        }}}});
+        let doc = parse_item(&response, "o/r", 7).unwrap();
+        let cached: ItemDoc = serde_json::from_str(&serde_json::to_string(&doc).unwrap()).unwrap();
+        assert_eq!(cached.comments.len(), 4);
+        assert!(cached.comments[0].is_bot);
+        assert!(!cached.comments[1].is_bot);
+        assert!(!cached.comments[2].is_bot);
+        assert_eq!(cached.comments[2].author, "ghost");
+        assert!(cached.comments[3].is_bot);
+        assert_eq!(cached.comments[3].kind, "changes requested");
+
+        let old_comment: Comment = serde_json::from_value(serde_json::json!({
+            "author": "review-app[bot]", "date": "2026-09-05", "kind": "", "body": "Cached comment"
+        })).unwrap();
+        assert!(!old_comment.is_bot); // old caches still deserialize; the view checks the suffix
+        assert_eq!(old_comment.author, "review-app[bot]");
+    }
 
     #[test]
     fn review_decisions_and_requested_reviewers() {

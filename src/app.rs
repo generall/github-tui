@@ -39,6 +39,8 @@ pub struct ItemView {
     pub find: String,
     pub matches: Vec<usize>, // line indices containing the find query
     pub msel: usize,
+    pub show_long_bot_comments: bool,
+    comment_lines: Vec<usize>, // comment header positions, used to preserve scroll when toggling
 }
 
 impl ItemView {
@@ -58,6 +60,8 @@ impl ItemView {
             find: String::new(),
             matches: Vec::new(),
             msel: 0,
+            show_long_bot_comments: false,
+            comment_lines: Vec::new(),
         }
     }
 
@@ -127,8 +131,10 @@ impl ItemView {
             }));
         };
         append(&doc.body, &mut lines);
+        self.comment_lines.clear();
         for c in &doc.comments {
             lines.push(Line::default());
+            self.comment_lines.push(lines.len());
             let kind = if c.kind.is_empty() { String::new() } else { format!(" · {}", c.kind) };
             lines.push(Line::from(vec![
                 Span::styled("── ", Style::default().fg(Color::DarkGray)),
@@ -136,7 +142,18 @@ impl ItemView {
                 Span::styled(format!(" · {}{kind} ", c.date), Style::default().fg(Color::DarkGray)),
                 Span::styled("─".repeat(30), Style::default().fg(Color::DarkGray)),
             ]));
-            append(&c.body, &mut lines);
+            // GraphQL identifies bots even when their login lacks the [bot] suffix.
+            // The suffix also supports comments loaded from older disk caches.
+            let long_bot = (c.is_bot || c.author.ends_with("[bot]"))
+                && (c.body.trim().lines().count() > 10 || c.body.chars().count() > 1000);
+            if long_bot && !self.show_long_bot_comments {
+                lines.push(Line::from(Span::styled(
+                    "  [long bot comment hidden · x to expand]",
+                    Style::default().fg(Color::DarkGray),
+                )));
+            } else {
+                append(&c.body, &mut lines);
+            }
         }
         self.lines = lines;
         self.links = links;
@@ -146,6 +163,19 @@ impl ItemView {
             self.link_sel = None;
         }
         self.recompute_matches();
+    }
+
+    fn toggle_bot_comments(&mut self, doc: &ItemDoc) {
+        let anchor = self.comment_lines.iter().enumerate().rev()
+            .find(|&(_, &line)| line <= self.scroll)
+            .map(|(i, &line)| (i, self.scroll - line));
+        self.show_long_bot_comments = !self.show_long_bot_comments;
+        self.link_sel = None; // hidden links must not leave a different link selected
+        self.set_doc(doc);
+        if let Some((i, offset)) = anchor {
+            let end = self.comment_lines.get(i + 1).copied().unwrap_or(self.lines.len());
+            self.scroll = (self.comment_lines[i] + offset).min(end.saturating_sub(1));
+        }
     }
 }
 
@@ -1248,6 +1278,11 @@ impl App {
             KeyCode::PageUp => p.scroll = p.scroll.saturating_sub(page * 2),
             KeyCode::Char('g') | KeyCode::Home => p.scroll = 0,
             KeyCode::Char('G') | KeyCode::End => p.scroll = max,
+            KeyCode::Char('x') => {
+                if let Some(doc) = self.cache.items.get(&p.key()) {
+                    p.toggle_bot_comments(doc);
+                }
+            }
             KeyCode::Char('/') => {
                 p.find.clear();
                 p.recompute_matches();
@@ -1651,6 +1686,86 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn comment(author: &str, is_bot: bool, body: String) -> crate::backend::Comment {
+        crate::backend::Comment {
+            author: author.into(), is_bot, date: "2026-09-05".into(), kind: String::new(), body,
+        }
+    }
+
+    fn item_text(view: &ItemView) -> String {
+        view.lines.iter().map(|line| line.to_string()).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn only_long_bot_comments_are_collapsed_by_default() {
+        let doc = ItemDoc {
+            body: "PR description".into(),
+            comments: vec![
+                comment("review-app", true, "Hidden bot detail\n".repeat(11)),
+                comment("cached-app[bot]", false, "Hidden cached detail\n".repeat(11)),
+                comment("review-app", true, "z".repeat(1001)),
+                comment("review-app", true, "Short bot comment".into()),
+                comment("review-app", true, "Ten lines\n".repeat(10)),
+                comment("review-app", true, "é".repeat(1000)),
+                comment("robotics-dev", false, "Human detail\n".repeat(11)),
+            ],
+            ..Default::default()
+        };
+        for is_pr in [false, true] {
+            let mut view = ItemView::new("o/r".into(), 7, String::new());
+            view.set_doc(&ItemDoc { is_pr, ..doc.clone() });
+            let text = item_text(&view);
+            assert_eq!(text.matches("long bot comment hidden").count(), 3);
+            assert!(!text.contains("Hidden bot detail"));
+            assert!(!text.contains("Hidden cached detail"));
+            assert!(!text.contains(&"z".repeat(1001)));
+            for visible in ["PR description", "Short bot comment", "Ten lines", "Human detail", &"é".repeat(1000)] {
+                assert!(text.contains(visible));
+            }
+        }
+    }
+
+    #[test]
+    fn bot_comment_toggle_updates_links_and_search_and_preserves_position() {
+        let mut app = review_app(true);
+        let doc = app.cache.items.get_mut("o/r#7").unwrap();
+        let mut review = comment("review-app", true, format!("{}\n[Hidden detail](https://example.com/bot)", "Review detail\n".repeat(11)));
+        review.kind = "changes requested".into();
+        doc.comments = vec![review, comment("alice", false, "[Human reply](https://example.com/human)".into())];
+        let Some(Pane::Item(view)) = app.stack.last_mut() else { unreachable!() };
+        view.find = "Hidden detail".into();
+        view.set_doc(doc);
+        view.scroll = view.comment_lines[1];
+        let collapsed_scroll = view.scroll;
+        assert!(item_text(view).contains("review-app · 2026-09-05 · changes requested"));
+        assert_eq!(view.links.len(), 1);
+        assert!(view.matches.is_empty());
+
+        app.on_key(key(KeyCode::Char('x')));
+        let Some(Pane::Item(view)) = app.stack.last_mut() else { unreachable!() };
+        assert!(view.show_long_bot_comments);
+        assert_eq!(view.links.len(), 2);
+        assert_eq!(view.matches.len(), 1);
+        assert_eq!(view.scroll, view.comment_lines[1]);
+        assert!(view.scroll > collapsed_scroll);
+        assert!(view.lines[view.links[0].line].to_string().contains("Hidden detail"));
+        assert!(view.lines[view.links[1].line].to_string().contains("Human reply"));
+        // A background refresh keeps the user's expansion choice.
+        view.set_doc(app.cache.items.get("o/r#7").unwrap());
+        assert!(item_text(view).contains("Hidden detail"));
+        view.link_sel = Some(0);
+
+        app.on_key(key(KeyCode::Char('x')));
+        let Some(Pane::Item(view)) = app.stack.last() else { unreachable!() };
+        assert!(!view.show_long_bot_comments);
+        assert_eq!(view.links.len(), 1);
+        assert!(view.matches.is_empty());
+        assert!(view.link_sel.is_none());
+        assert_eq!(view.scroll, collapsed_scroll);
+        assert!(view.lines[view.links[0].line].to_string().contains("Human reply"));
+        assert_eq!(app.backend.pending, 0);
     }
 
     #[test]

@@ -33,6 +33,10 @@ Repo picker:
 - Lists of issues / PRs (open, closed, all — `v` to switch) as a table; rows open as pages
   rendering the body and comments as syntax-highlighted markdown, with `#123` references
   and GitHub URLs navigable in-app.
+- Long bot comments and reviews (over 10 lines or 1,000 characters) are collapsed
+  by default. Their author, date, and review status stay visible. Press `x` to
+  expand or collapse all long bot comments on the current page; short bot comments
+  and human comments stay visible.
 - PR tables include a colored review status: needs review, changes requested, or approved
   (`—` when GitHub has no review decision or request). `V` on a PR opens the review
   picker: comment, approve, or request changes. Write the message in `$VISUAL`/`$EDITOR`,
@@ -105,6 +109,7 @@ github-tui self-upgrade
 | list | `enter` | open row |
 | list | `a` | new issue: `$EDITOR` opens; first `# heading` = title, rest = body |
 | item | `j/k` `ctrl+d/u` `g/G` | scroll |
+| item | `x` | expand/collapse long bot comments and reviews (collapsed by default) |
 | item | `/` then `n`/`N` | find in page (highlighted), next/prev match; `esc` clears |
 | item | `tab` / `shift+tab` | cycle links (`#123`, issue/PR urls, external urls) |
 | item | `enter` | open selected link (external urls via `xdg-open`/`open`) |

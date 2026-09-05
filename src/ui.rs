@@ -272,10 +272,10 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         Some((msg, _)) => msg.clone(),
         None => match app.stack.last() {
             Some(Pane::Item(p)) if p.is_pr => {
-                " j/k · / find · tab links · V review · e edit · E vim · m metadata · C comment · c checkout · o browser · r refresh · ctrl+k · R repos · esc back · q quit".into()
+                " j/k · / find · tab links · x bots · V review · e edit · E vim · m metadata · C comment · c checkout · o browser · r refresh · ctrl+k · R repos · esc back · q quit".into()
             }
             Some(Pane::Item(_)) => {
-                " j/k · / find · tab links · e edit · E vim · m metadata · C comment · o browser · r refresh · ctrl+k · R repos · esc back · q quit".into()
+                " j/k · / find · tab links · x bots · e edit · E vim · m metadata · C comment · o browser · r refresh · ctrl+k · R repos · esc back · q quit".into()
             }
             Some(Pane::List(t)) if t.picker.is_some() => " j/k select view · enter apply · esc cancel · q quit".into(),
             Some(Pane::List(_)) => {
