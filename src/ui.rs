@@ -1,7 +1,7 @@
 //! Drawing: header, item/list panes, search & repo overlays, editor.
 
-use crate::app::{state_style, App, Pane, VIEWS};
-use crate::backend::COLUMNS;
+use crate::app::{review_style, state_style, App, Pane, ReviewMode, VIEWS};
+use crate::backend::ReviewKind;
 use edtui::{EditorTheme, EditorView};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
@@ -44,6 +44,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     if app.meta.is_some() {
         draw_meta(f, app, body);
+    }
+    if app.review.is_some() {
+        draw_review(f, app, body);
     }
     if app.search.is_some() {
         draw_search(f, app, body);
@@ -161,6 +164,40 @@ fn draw_meta(f: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+fn draw_review(f: &mut Frame, app: &App, area: Rect) {
+    let Some(review) = &app.review else { return };
+    let picking = review.mode == ReviewMode::Pick;
+    let popup = popup(area, 76, if picking { 7 } else { 18 });
+    f.render_widget(Clear, popup);
+    let hint = match review.mode {
+        ReviewMode::Pick => " j/k choose · enter compose · esc cancel ",
+        ReviewMode::Confirm => " enter submit · e edit · esc cancel ",
+        ReviewMode::Submitting => " submitting… ",
+    };
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(format!(" Review {}#{} ", review.repo, review.number))
+        .title_bottom(Span::styled(hint, Style::default().fg(Color::DarkGray)));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+    if picking {
+        let items = ReviewKind::ALL.iter().map(|kind| Line::from(kind.label())).collect();
+        f.render_widget(selectable(items, review.sel, inner.height), inner);
+    } else {
+        let mut lines = vec![
+            Line::from(Span::styled(review.kind().label(), Style::default().fg(Color::Yellow).bold())),
+            Line::default(),
+        ];
+        if review.body.is_empty() {
+            lines.push(Line::from("(no message)"));
+        } else {
+            lines.extend(review.body.lines().map(Line::from));
+        }
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    }
+}
+
 /// Visible slice of a single-line input, scrolled so the cursor stays in
 /// view: (before, under-cursor, after, cut-left, cut-right), within `width`
 /// columns including the cursor cell.
@@ -235,7 +272,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         Some((msg, _)) => msg.clone(),
         None => match app.stack.last() {
             Some(Pane::Item(p)) if p.is_pr => {
-                " j/k · / find · tab links · e edit · E vim · m metadata · C comment · c checkout · o browser · r refresh · ctrl+k · R repos · esc back · q quit".into()
+                " j/k · / find · tab links · V review · e edit · E vim · m metadata · C comment · c checkout · o browser · r refresh · ctrl+k · R repos · esc back · q quit".into()
             }
             Some(Pane::Item(_)) => {
                 " j/k · / find · tab links · e edit · E vim · m metadata · C comment · o browser · r refresh · ctrl+k · R repos · esc back · q quit".into()
@@ -377,13 +414,14 @@ fn highlight_find(line: &mut Line<'static>, query: &[char], hl: Style) {
 
 fn draw_list(f: &mut Frame, app: &mut App, area: Rect) {
     let Some(Pane::List(t)) = app.stack.last_mut() else { return };
+    let columns = t.columns();
     let doc = &t.doc;
     let col_width = |i: usize| -> u16 {
         let cap = if i == 1 { 80 } else { 30 };
         doc.rows
             .iter()
-            .map(|r| r.cells.get(i).map_or(0, |c| c.chars().count()))
-            .chain([COLUMNS[i].chars().count()])
+            .map(|r| r.cell(columns[i]).chars().count())
+            .chain([columns[i].chars().count()])
             .max()
             .unwrap_or(6)
             .clamp(4, cap) as u16
@@ -391,14 +429,14 @@ fn draw_list(f: &mut Frame, app: &mut App, area: Rect) {
     // number + title pinned, then as many scrolled columns as actually fit;
     // the title shrinks (to 30) before it starves the other columns
     let avail = area.width.saturating_sub(2);
-    let others: u16 = (2..COLUMNS.len()).map(|i| 2 + col_width(i)).sum();
+    let others: u16 = (2..columns.len()).map(|i| 2 + col_width(i)).sum();
     let title_w = col_width(1)
         .min(avail.saturating_sub(col_width(0) + 2 + others).max(30))
         .min(avail.saturating_sub(col_width(0) + 2));
     let mut idx: Vec<usize> = vec![0, 1];
     let mut used = col_width(0) + 2 + title_w;
     let mut widths: Vec<Constraint> = vec![Constraint::Length(col_width(0)), Constraint::Length(title_w)];
-    for i in 2 + t.col_offset..COLUMNS.len() {
+    for i in 2 + t.col_offset..columns.len() {
         let w = col_width(i);
         if used + 2 + w > avail {
             break;
@@ -408,7 +446,7 @@ fn draw_list(f: &mut Frame, app: &mut App, area: Rect) {
         widths.push(Constraint::Length(w));
     }
     let header = Row::new(
-        idx.iter().map(|&i| Span::styled(COLUMNS[i], Style::default().fg(ACCENT).bold())),
+        idx.iter().map(|&i| Span::styled(columns[i], Style::default().fg(ACCENT).bold())),
     );
     let col_widths: Vec<usize> = widths
         .iter()
@@ -421,28 +459,29 @@ fn draw_list(f: &mut Frame, app: &mut App, area: Rect) {
     let expanded = t.expanded;
     let rows = vis.iter().map(|&ri| {
         let r = &doc.rows[ri];
-        let cell_style = |i: usize, text: &str| match i {
-            0 => Style::default().fg(Color::DarkGray),
-            2 => state_style(text),
+        let cell_style = |i: usize| match columns[i] {
+            "#" => Style::default().fg(Color::DarkGray),
+            "state" => state_style(r.cell(columns[i])),
+            "review" => review_style(r.cell(columns[i])),
             _ => Style::default(),
         };
         if expanded {
             let cells: Vec<Vec<String>> = idx
                 .iter()
                 .zip(&col_widths)
-                .map(|(&i, &w)| wrap_cell(r.cells.get(i).map_or("", String::as_str), w, 8))
+                .map(|(&i, &w)| wrap_cell(r.cell(columns[i]), w, 8))
                 .collect();
             let height = cells.iter().map(Vec::len).max().unwrap_or(1).max(1);
             Row::new(cells.into_iter().zip(&idx).map(|(lines, &i)| {
-                let style = cell_style(i, lines.first().map_or("", String::as_str));
+                let style = cell_style(i);
                 Text::from(lines.into_iter().map(|l| Line::from(Span::styled(l, style))).collect::<Vec<_>>())
             }))
             .height(height as u16)
             .bottom_margin(1)
         } else {
             Row::new(idx.iter().map(|&i| {
-                let cell = r.cells.get(i).cloned().unwrap_or_default();
-                let style = cell_style(i, &cell);
+                let cell = r.cell(columns[i]);
+                let style = cell_style(i);
                 Text::from(Span::styled(cell.chars().take(80).collect::<String>(), style))
             }))
         }

@@ -33,6 +33,12 @@ Repo picker:
 - Lists of issues / PRs (open, closed, all — `v` to switch) as a table; rows open as pages
   rendering the body and comments as syntax-highlighted markdown, with `#123` references
   and GitHub URLs navigable in-app.
+- PR tables include a colored review status: needs review, changes requested, or approved
+  (`—` when GitHub has no review decision or request). `V` on a PR opens the review
+  picker: comment, approve, or request changes. Write the message in `$VISUAL`/`$EDITOR`,
+  then press `enter` to submit from the preview or `esc` to cancel. Approval messages
+  are optional; comments and change requests need a message. Failed submissions keep
+  the draft for editing or retry.
 - `ctrl+k` search palette: keystrokes re-rank known items instantly client-side.
   Every query word must match; word-start matches beat mid-word beat fuzzy, and
   within a tier items you open often/recently win (zoxide-style frecency), then
@@ -107,6 +113,7 @@ github-tui self-upgrade
 | item | `m` | metadata editor: pick a field, then type-aware editing |
 | metadata | `enter` | state/draft toggle; labels/assignees/reviewers open a multi-pick (`space` toggles); milestone opens a picker; title/base get an inline input |
 | item | `C` | comment (`$EDITOR`) |
+| item (PR) | `V` | review: comment, approve, or request changes (`$EDITOR`, then preview and submit) |
 | item (PR) | `c` | `gh pr checkout` into the current directory |
 | editor | vim keys | edtui: normal/insert/visual modes |
 | editor | `ctrl+s` / `ctrl+q` | save & close / discard |

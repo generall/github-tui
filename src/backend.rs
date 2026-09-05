@@ -24,6 +24,8 @@ pub struct ItemDoc {
     pub labels: Vec<String>,
     pub assignees: Vec<String>,
     pub reviewers: Vec<String>,
+    #[serde(default)]
+    pub review_status: String,
     pub milestone: String,
     pub head: String,
     pub base: String,
@@ -56,6 +58,7 @@ impl ItemDoc {
         p.push(("author".into(), self.author.clone()));
         if self.is_pr {
             p.push(("branch".into(), format!("{} → {}", self.head, self.base)));
+            p.push(("review".into(), self.review_status.clone()));
         }
         for (k, v) in [("labels", &self.labels), ("assignees", &self.assignees), ("reviewers", &self.reviewers)] {
             if !v.is_empty() {
@@ -72,6 +75,7 @@ impl ItemDoc {
 }
 
 pub const COLUMNS: &[&str] = &["#", "title", "state", "author", "labels", "assignees", "milestone", "updated"];
+pub const PR_COLUMNS: &[&str] = &["#", "title", "state", "review", "author", "labels", "assignees", "milestone", "updated"];
 const PAGE: usize = 50;
 
 #[derive(Clone, Serialize, Deserialize, Default)]
@@ -87,6 +91,46 @@ pub struct RowDoc {
     pub number: u64,
     pub is_pr: bool,
     pub cells: Vec<String>,
+    // Keep the original cell order so caches from older versions still load.
+    #[serde(default)]
+    pub review_status: String,
+}
+
+impl RowDoc {
+    pub fn cell(&self, column: &str) -> &str {
+        if column == "review" {
+            return if self.review_status.is_empty() { "—" } else { &self.review_status };
+        }
+        COLUMNS.iter().position(|&c| c == column)
+            .and_then(|i| self.cells.get(i)).map_or("", String::as_str)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewKind {
+    Comment,
+    Approve,
+    RequestChanges,
+}
+
+impl ReviewKind {
+    pub const ALL: [Self; 3] = [Self::Comment, Self::Approve, Self::RequestChanges];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Comment => "Comment",
+            Self::Approve => "Approve",
+            Self::RequestChanges => "Request changes",
+        }
+    }
+
+    fn flag(self) -> &'static str {
+        match self {
+            Self::Comment => "--comment",
+            Self::Approve => "--approve",
+            Self::RequestChanges => "--request-changes",
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
@@ -122,6 +166,7 @@ pub enum Msg {
     Edited { key: String, res: Result<()> },
     Created { repo: String, res: Result<u64> },
     Commented { key: String, res: Result<()> },
+    Reviewed { key: String, res: Result<()> },
     Meta { repo: String, res: Result<RepoMeta> },
     Repos { res: Result<Vec<String>> },
     CwdPr { repo: String, res: Result<Option<(u64, String)>> },
@@ -347,6 +392,17 @@ impl Backend {
         });
     }
 
+    pub fn review(&mut self, repo: String, number: u64, kind: ReviewKind, body: String) {
+        let key = ItemDoc::key(&repo, number);
+        self.spawn(Some(format!("review:{key}")), move || {
+            let res = run_gh(
+                &["pr", "review", &number.to_string(), "--repo", &repo, kind.flag(), "--body-file", "-"],
+                Some(&body),
+            ).map(|_| ());
+            Msg::Reviewed { key, res }
+        });
+    }
+
     pub fn fetch_repos(&mut self) {
         self.spawn(Some("repos".into()), move || {
             let res = api("user/repos?per_page=100&sort=pushed")
@@ -443,8 +499,8 @@ fn login(v: &Value) -> String {
 
 const ITEM_QUERY: &str = "query($owner:String!,$name:String!,$n:Int!){repository(owner:$owner,name:$name){issueOrPullRequest(number:$n){__typename \
 ... on Issue{number title body state url createdAt updatedAt author{login} labels(first:50){nodes{name}} assignees(first:20){nodes{login}} milestone{title} comments(first:100){nodes{author{login} createdAt body}}} \
-... on PullRequest{number title body state url createdAt updatedAt isDraft headRefName baseRefName author{login} labels(first:50){nodes{name}} assignees(first:20){nodes{login}} milestone{title} \
-reviewRequests(first:20){nodes{requestedReviewer{... on User{login} ... on Team{name}}}} reviews(first:50){nodes{author{login} state createdAt body}} comments(first:100){nodes{author{login} createdAt body}}}}}}";
+... on PullRequest{number title body state url createdAt updatedAt isDraft headRefName baseRefName reviewDecision author{login} labels(first:50){nodes{name}} assignees(first:20){nodes{login}} milestone{title} \
+reviewRequests(first:20){totalCount nodes{requestedReviewer{... on User{login} ... on Team{name}}}} reviews(first:50){nodes{author{login} state createdAt body}} comments(first:100){nodes{author{login} createdAt body}}}}}}";
 
 fn fetch_item_sync(repo: &str, number: u64) -> Result<ItemDoc> {
     let (owner, name) = repo.split_once('/').ok_or_else(|| anyhow!("bad repo {repo}"))?;
@@ -500,6 +556,7 @@ fn fetch_item_sync(repo: &str, number: u64) -> Result<ItemDoc> {
             .as_array()
             .map(|a| a.iter().map(|n| login(&n["requestedReviewer"])).collect())
             .unwrap_or_default(),
+        review_status: if is_pr { review_status(it).into() } else { String::new() },
         milestone: it["milestone"]["title"].as_str().unwrap_or("").into(),
         head: it["headRefName"].as_str().unwrap_or("").into(),
         base: it["baseRefName"].as_str().unwrap_or("").into(),
@@ -514,7 +571,7 @@ fn fetch_item_sync(repo: &str, number: u64) -> Result<ItemDoc> {
 fn fetch_list_sync(repo: &str, kind: &str, state: &str, page: u32) -> Result<ListDoc> {
     let v = api(&format!("repos/{repo}/{kind}?state={state}&per_page={PAGE}&page={page}&sort=updated&direction=desc"))?;
     let arr = v.as_array().ok_or_else(|| anyhow!("unexpected response"))?;
-    let rows = arr
+    let mut rows: Vec<RowDoc> = arr
         .iter()
         .filter(|it| kind == "pulls" || it.get("pull_request").is_none())
         .map(|it| {
@@ -529,6 +586,7 @@ fn fetch_list_sync(repo: &str, kind: &str, state: &str, page: u32) -> Result<Lis
             RowDoc {
                 number: it["number"].as_u64().unwrap_or(0),
                 is_pr,
+                review_status: String::new(),
                 cells: vec![
                     format!("#{}", it["number"].as_u64().unwrap_or(0)),
                     it["title"].as_str().unwrap_or("").to_string(),
@@ -542,7 +600,44 @@ fn fetch_list_sync(repo: &str, kind: &str, state: &str, page: u32) -> Result<Lis
             }
         })
         .collect();
+    if kind == "pulls" && !rows.is_empty() {
+        fetch_review_statuses(repo, &mut rows)?;
+    }
     Ok(ListDoc { rows, has_more: arr.len() == PAGE, page })
+}
+
+fn review_status(pr: &Value) -> &'static str {
+    match pr["reviewDecision"].as_str() {
+        Some("APPROVED") => "approved",
+        Some("CHANGES_REQUESTED") => "changes requested",
+        Some("REVIEW_REQUIRED") => "needs review",
+        _ if pr["reviewRequests"]["totalCount"].as_u64().unwrap_or(0) > 0 => "needs review",
+        _ => "—",
+    }
+}
+
+/// Fetch review decisions for a whole REST page in one GraphQL request.
+fn fetch_review_statuses(repo: &str, rows: &mut [RowDoc]) -> Result<()> {
+    let (owner, name) = repo.split_once('/').ok_or_else(|| anyhow!("bad repo {repo}"))?;
+    let fields = rows.iter().map(|r| format!(
+        "pr{}:pullRequest(number:{}){{reviewDecision reviewRequests{{totalCount}}}}", r.number, r.number,
+    )).collect::<Vec<_>>().join(" ");
+    let query = format!("query($owner:String!,$name:String!){{repository(owner:$owner,name:$name){{{fields}}}}}");
+    let input = serde_json::json!({"query": query, "variables": {"owner": owner, "name": name}});
+    let out = run_gh(&["api", "graphql", "--input", "-"], Some(&input.to_string()))?;
+    let v: Value = serde_json::from_str(&out)?;
+    apply_review_statuses(repo, rows, &v)
+}
+
+fn apply_review_statuses(repo: &str, rows: &mut [RowDoc], response: &Value) -> Result<()> {
+    for row in rows {
+        let pr = &response["data"]["repository"][format!("pr{}", row.number)];
+        if pr.is_null() {
+            return Err(anyhow!("review status missing for {repo}#{}", row.number));
+        }
+        row.review_status = review_status(pr).into();
+    }
+    Ok(())
 }
 
 fn search_sync(repo: &str, query: &str) -> Result<Vec<SearchHit>> {
@@ -673,6 +768,49 @@ pub fn apply_field(doc: &mut ItemDoc, field: &str, value: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_decisions_and_requested_reviewers() {
+        for (decision, requests, expected) in [
+            (Some("APPROVED"), 2, "approved"),
+            (Some("CHANGES_REQUESTED"), 1, "changes requested"),
+            (Some("REVIEW_REQUIRED"), 0, "needs review"),
+            (None, 1, "needs review"),
+            (None, 0, "—"),
+        ] {
+            let pr = serde_json::json!({"reviewDecision": decision, "reviewRequests": {"totalCount": requests}});
+            assert_eq!(review_status(&pr), expected);
+        }
+    }
+
+    #[test]
+    fn review_statuses_match_pr_numbers_and_reject_missing_results() {
+        let mut rows = vec![7, 3].into_iter().map(|number| RowDoc {
+            number, is_pr: true, cells: vec![], review_status: String::new(),
+        }).collect::<Vec<_>>();
+        let response = serde_json::json!({"data": {"repository": {
+            "pr3": {"reviewDecision": "CHANGES_REQUESTED"},
+            "pr7": {"reviewDecision": "APPROVED"}
+        }}});
+        apply_review_statuses("o/r", &mut rows, &response).unwrap();
+        assert_eq!(rows[0].review_status, "approved");
+        assert_eq!(rows[1].review_status, "changes requested");
+        assert!(apply_review_statuses("o/r", &mut rows, &serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn old_cache_preserves_column_alignment() {
+        let row: RowDoc = serde_json::from_value(serde_json::json!({
+            "number": 7, "is_pr": true,
+            "cells": ["#7", "Title", "open", "author", "bug", "alice", "v1", "2026-09-05"]
+        })).unwrap();
+        assert_eq!(row.cell("review"), "—");
+        assert_eq!(row.cell("author"), "author");
+        assert_eq!(row.cell("updated"), "2026-09-05");
+        let mut old_item = serde_json::to_value(ItemDoc::default()).unwrap();
+        old_item.as_object_mut().unwrap().remove("review_status");
+        assert!(serde_json::from_value::<ItemDoc>(old_item).unwrap().review_status.is_empty());
+    }
 
     #[test]
     fn remote_urls() {

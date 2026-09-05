@@ -2,7 +2,7 @@
 
 use crate::backend::{
     apply_field, edit_cmds, editable_fields, epoch, frecency, list_key, Backend, Cache, ItemDoc,
-    ListDoc, Msg, SearchHit, COLUMNS,
+    ListDoc, Msg, ReviewKind, SearchHit, COLUMNS, PR_COLUMNS,
 };
 use crate::md::{self, Target};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -104,7 +104,11 @@ impl ItemView {
             .props()
             .iter()
             .map(|(k, v)| {
-                let vs = if k == "state" { state_style(v) } else { Style::default().fg(Color::Gray) };
+                let vs = match k.as_str() {
+                    "state" => state_style(v),
+                    "review" => review_style(v),
+                    _ => Style::default().fg(Color::Gray),
+                };
                 Line::from(vec![
                     Span::styled(format!("{k}: "), Style::default().fg(Color::DarkGray)),
                     Span::styled(v.clone(), vs),
@@ -156,6 +160,15 @@ pub fn state_style(state: &str) -> Style {
     }
 }
 
+pub fn review_style(status: &str) -> Style {
+    Style::default().fg(match status {
+        "approved" => Color::Green,
+        "changes requested" => Color::Red,
+        "needs review" => Color::Yellow,
+        _ => Color::DarkGray,
+    })
+}
+
 pub struct ListView {
     pub repo: String,
     pub view: usize, // index into VIEWS
@@ -187,6 +200,10 @@ impl ListView {
         VIEWS[self.view].0
     }
 
+    pub fn columns(&self) -> &'static [&'static str] {
+        if VIEWS[self.view].1 == "pulls" { PR_COLUMNS } else { COLUMNS }
+    }
+
     pub fn key(&self) -> String {
         let (_, kind, state) = VIEWS[self.view];
         list_key(&self.repo, kind, state)
@@ -203,7 +220,8 @@ impl ListView {
             .rows
             .iter()
             .enumerate()
-            .filter(|(_, r)| r.cells.iter().any(|c| c.to_lowercase().contains(&q)))
+            .filter(|(_, r)| r.cells.iter().any(|c| c.to_lowercase().contains(&q))
+                || r.review_status.to_lowercase().contains(&q))
             .map(|(i, _)| i)
             .collect()
     }
@@ -360,7 +378,29 @@ pub struct ExternalEdit {
 pub enum ExternalReq {
     Body { repo: String, number: u64, is_pr: bool },
     Comment { repo: String, number: u64, is_pr: bool },
+    Review { repo: String, number: u64, kind: ReviewKind },
     NewIssue { repo: String },
+}
+
+pub struct ReviewDialog {
+    pub repo: String,
+    pub number: u64,
+    pub sel: usize,
+    pub body: String,
+    pub mode: ReviewMode,
+}
+
+#[derive(PartialEq, Eq)]
+pub enum ReviewMode {
+    Pick,
+    Confirm,
+    Submitting,
+}
+
+impl ReviewDialog {
+    pub fn kind(&self) -> ReviewKind {
+        ReviewKind::ALL[self.sel]
+    }
 }
 
 /// Field-at-a-time metadata editor overlay (`m` on an item).
@@ -401,6 +441,7 @@ pub struct App {
     pub find_input: bool, // `/` prompt active in the footer
     pub external: Option<ExternalEdit>, // picked up by the main loop
     pub meta: Option<MetaEditor>,
+    pub review: Option<ReviewDialog>,
     pub cwd_repo: Option<String>,
     search_seq: u64,
 }
@@ -419,6 +460,7 @@ impl App {
             find_input: false,
             external: None,
             meta: None,
+            review: None,
             cwd_repo,
             search_seq: 0,
         };
@@ -653,6 +695,58 @@ impl App {
         });
     }
 
+    fn start_review(&mut self) {
+        let Some(doc) = self.top_doc() else { return };
+        if !doc.is_pr {
+            self.set_status("not a pull request");
+            return;
+        }
+        let Some(Pane::Item(p)) = self.stack.last() else { return };
+        self.review = Some(ReviewDialog {
+            repo: p.repo.clone(), number: p.number, sel: 0,
+            body: String::new(), mode: ReviewMode::Pick,
+        });
+    }
+
+    fn on_review_key(&mut self, key: KeyEvent) {
+        let Some(review) = &mut self.review else { return };
+        if review.mode == ReviewMode::Submitting {
+            return;
+        }
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.review = None;
+                self.set_status("review cancelled");
+            }
+            KeyCode::Char('j') | KeyCode::Down if review.mode == ReviewMode::Pick => {
+                review.sel = (review.sel + 1).min(ReviewKind::ALL.len() - 1);
+            }
+            KeyCode::Char('k') | KeyCode::Up if review.mode == ReviewMode::Pick => {
+                review.sel = review.sel.saturating_sub(1);
+            }
+            KeyCode::Enter if review.mode == ReviewMode::Confirm => {
+                review.mode = ReviewMode::Submitting;
+                self.backend.review(review.repo.clone(), review.number, review.kind(), review.body.clone());
+                self.set_status("submitting review…");
+            }
+            KeyCode::Enter | KeyCode::Char('e') => {
+                let hint = if review.kind() == ReviewKind::Approve {
+                    "A message is optional. Save and close to preview your approval."
+                } else {
+                    "Write your review above. An empty message cancels the review."
+                };
+                self.external = Some(ExternalEdit {
+                    template: format!("{}\n\n<!-- {} {}#{}: {hint} -->\n",
+                        review.body, review.kind().label(), review.repo, review.number),
+                    req: ExternalReq::Review {
+                        repo: review.repo.clone(), number: review.number, kind: review.kind(),
+                    },
+                });
+            }
+            _ => {}
+        }
+    }
+
     fn start_meta_edit(&mut self) {
         let Some(doc) = self.top_doc() else { return };
         let Some(Pane::Item(p)) = self.stack.last() else { return };
@@ -875,6 +969,18 @@ impl App {
                     self.set_status("posting comment…");
                 }
             }
+            ExternalReq::Review { repo, number, kind } => {
+                let text = body(&content);
+                if text.is_empty() && kind != ReviewKind::Approve {
+                    self.review = None;
+                    self.set_status("empty, no review submitted");
+                } else {
+                    self.review = Some(ReviewDialog {
+                        repo, number, sel: ReviewKind::ALL.iter().position(|&k| k == kind).unwrap(),
+                        body: text, mode: ReviewMode::Confirm,
+                    });
+                }
+            }
             ExternalReq::NewIssue { repo } => {
                 let text = body(&content);
                 let (title, rest) = text.split_once('\n').unwrap_or((text.as_str(), ""));
@@ -899,6 +1005,10 @@ impl App {
         }
         if self.editor.is_some() {
             self.on_editor_key(key, ctrl);
+            return;
+        }
+        if self.review.is_some() {
+            self.on_review_key(key);
             return;
         }
         if ctrl && key.code == KeyCode::Char('k') {
@@ -956,6 +1066,7 @@ impl App {
             KeyCode::Char('m') => self.start_meta_edit(),
             KeyCode::Char('a') => self.start_new_issue(),
             KeyCode::Char('C') => self.start_comment(),
+            KeyCode::Char('V') => self.start_review(),
             KeyCode::Char('c') => self.checkout_pr(),
             KeyCode::Char('o') => {
                 let url = match self.stack.last() {
@@ -1232,7 +1343,7 @@ impl App {
             }
             KeyCode::Char('h') | KeyCode::Left => t.col_offset = t.col_offset.saturating_sub(1),
             KeyCode::Char('l') | KeyCode::Right => {
-                t.col_offset = (t.col_offset + 1).min(COLUMNS.len().saturating_sub(3))
+                t.col_offset = (t.col_offset + 1).min(t.columns().len().saturating_sub(3))
             }
             KeyCode::Char('x') => t.expanded = !t.expanded,
             KeyCode::Enter => {
@@ -1400,6 +1511,28 @@ impl App {
                     Err(e) => self.set_status(format!("comment failed: {e}")),
                 }
             }
+            Msg::Reviewed { key, res } => {
+                self.backend.finish(Some(&format!("review:{key}")));
+                match res {
+                    Ok(()) => {
+                        self.review = None;
+                        self.set_status("review submitted ✓");
+                        self.refetch(&key);
+                        if let Some((repo, _)) = key.rsplit_once('#') {
+                            // Other cached views must not keep the old decision.
+                            self.cache.lists.retain(|k, _| !k.starts_with(&format!("{repo}:pulls:")));
+                            self.cache.save();
+                            self.refresh_lists(repo);
+                        }
+                    }
+                    Err(e) => {
+                        if let Some(review) = &mut self.review {
+                            review.mode = ReviewMode::Confirm;
+                        }
+                        self.set_status(format!("review failed: {e}"));
+                    }
+                }
+            }
             Msg::Created { repo, res } => {
                 self.backend.finish(Some(&format!("create:{repo}")));
                 match res {
@@ -1499,6 +1632,139 @@ mod tests {
         app.search = None;
         app.repos = None;
         app
+    }
+
+    // No worker threads or disk cache: review tests must never submit real reviews.
+    fn review_app(is_pr: bool) -> App {
+        let doc = ItemDoc { number: 7, is_pr, state: "open".into(), ..Default::default() };
+        let mut view = ItemView::new("o/r".into(), 7, String::new());
+        view.set_doc(&doc);
+        let mut cache = Cache::default();
+        cache.items.insert("o/r#7".into(), doc);
+        App {
+            stack: vec![Pane::Item(view)], search: None, repos: None, editor: None,
+            backend: Backend::new(std::sync::mpsc::channel().0), cache, status: None,
+            quit: false, find_input: false, external: None, meta: None, review: None,
+            cwd_repo: None, search_seq: 0,
+        }
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn review_picker_is_pr_only_and_can_cancel() {
+        let mut issue = review_app(false);
+        issue.on_key(key(KeyCode::Char('V')));
+        assert!(issue.review.is_none());
+
+        let mut app = review_app(true);
+        app.on_key(key(KeyCode::Char('V')));
+        assert_eq!(app.review.as_ref().unwrap().kind(), ReviewKind::Comment);
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Enter));
+        let ext = app.external.take().unwrap();
+        assert!(matches!(ext.req, ExternalReq::Review { kind: ReviewKind::Approve, number: 7, .. }));
+        app.on_external(ext.req, Some(ext.template));
+        let review = app.review.as_ref().unwrap();
+        assert!(review.mode == ReviewMode::Confirm);
+        assert!(review.body.is_empty());
+        assert_eq!(app.backend.pending, 0); // previewing does not submit
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.review.is_none());
+        assert_eq!(app.stack.len(), 1); // Escape belongs to the dialog
+        assert!(!app.quit);
+    }
+
+    #[test]
+    fn review_requires_text_except_for_approval() {
+        for kind in [ReviewKind::Comment, ReviewKind::RequestChanges] {
+            let mut app = review_app(true);
+            app.on_external(ExternalReq::Review { repo: "o/r".into(), number: 7, kind },
+                Some("\n<!-- template -->\n  ".into()));
+            assert!(app.review.is_none());
+            assert_eq!(app.backend.pending, 0);
+            app.on_external(ExternalReq::Review { repo: "o/r".into(), number: 7, kind },
+                Some("Please fix this.\n\nDetails.\n<!-- template -->".into()));
+            let review = app.review.as_ref().unwrap();
+            assert_eq!(review.kind(), kind);
+            assert_eq!(review.body, "Please fix this.\n\nDetails.");
+            assert!(review.mode == ReviewMode::Confirm);
+        }
+    }
+
+    #[test]
+    fn failed_review_keeps_draft_and_editor_abort_preserves_it() {
+        let mut app = review_app(true);
+        app.on_external(ExternalReq::Review {
+            repo: "o/r".into(), number: 7, kind: ReviewKind::RequestChanges,
+        }, Some("Please fix this.".into()));
+        app.review.as_mut().unwrap().mode = ReviewMode::Submitting;
+        app.on_key(key(KeyCode::Enter)); // no duplicate request while submitting
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.backend.pending, 0);
+        assert!(app.review.is_some());
+        app.on_msg(Msg::Reviewed { key: "o/r#7".into(), res: Err(anyhow::anyhow!("permission denied")) });
+        let review = app.review.as_ref().unwrap();
+        assert!(review.mode == ReviewMode::Confirm);
+        assert_eq!(review.body, "Please fix this.");
+        assert!(app.status.as_ref().unwrap().0.contains("permission denied"));
+        app.on_key(key(KeyCode::Char('e')));
+        let ext = app.external.take().unwrap();
+        assert!(ext.template.starts_with("Please fix this."));
+        app.on_external(ext.req, None);
+        assert_eq!(app.review.as_ref().unwrap().body, "Please fix this.");
+    }
+
+    #[test]
+    fn pr_columns_and_filter_include_review_status() {
+        let mut list = ListView::new("o/r".into());
+        assert!(!list.columns().contains(&"review"));
+        list.view = 1;
+        assert_eq!(list.columns()[3], "review");
+        list.doc.rows.push(crate::backend::RowDoc {
+            number: 7, is_pr: true, cells: vec!["#7".into(), "Title".into(), "open".into()],
+            review_status: "changes requested".into(),
+        });
+        list.find = "CHANGES".into();
+        assert_eq!(list.visible(), vec![0]);
+        list.find = "approved".into();
+        assert!(list.visible().is_empty());
+    }
+
+    #[test]
+    fn review_table_and_dialog_render() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut app = review_app(true);
+        let mut list = ListView::new("o/r".into());
+        list.view = 1;
+        list.loaded = true;
+        list.doc.rows.push(crate::backend::RowDoc {
+            number: 7, is_pr: true,
+            cells: vec!["#7".into(), "Title".into(), "open".into(), "alice".into()],
+            review_status: "changes requested".into(),
+        });
+        app.stack = vec![Pane::List(list)];
+        for expanded in [false, true] {
+            let Some(Pane::List(list)) = app.stack.last_mut() else { unreachable!() };
+            list.expanded = expanded;
+            let mut terminal = Terminal::new(TestBackend::new(140, 20)).unwrap();
+            terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let text = buffer.content.iter().map(|c| c.symbol()).collect::<String>();
+            assert!(text.contains("changes requested"));
+            assert!(text.contains("alice"));
+            let red = buffer.content.iter().filter(|c| c.fg == Color::Red)
+                .map(|c| c.symbol()).collect::<String>();
+            assert!(red.contains("changes requested"));
+        }
+        app = review_app(true);
+        app.on_key(key(KeyCode::Char('V')));
+        for (width, height) in [(80, 24), (10, 3), (1, 1)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        }
     }
 
     #[test]
