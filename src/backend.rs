@@ -33,6 +33,26 @@ pub struct ItemDoc {
     pub updated: String,
     pub url: String,
     pub comments: Vec<Comment>,
+    /// None for issues and cached PRs loaded before file statistics were stored.
+    #[serde(default)]
+    pub file_changes: Option<FileChanges>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct FileChanges {
+    pub total: u64,
+    pub additions: u64,
+    pub deletions: u64,
+    /// The first 100 files; totals describe the entire PR.
+    pub files: Vec<ChangedFile>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ChangedFile {
+    pub path: String,
+    pub additions: u64,
+    pub deletions: u64,
+    pub change_type: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -502,6 +522,7 @@ fn login(v: &Value) -> String {
 const ITEM_QUERY: &str = "query($owner:String!,$name:String!,$n:Int!){repository(owner:$owner,name:$name){issueOrPullRequest(number:$n){__typename \
 ... on Issue{number title body state url createdAt updatedAt author{login} labels(first:50){nodes{name}} assignees(first:20){nodes{login}} milestone{title} comments(first:100){nodes{author{login __typename} createdAt body}}} \
 ... on PullRequest{number title body state url createdAt updatedAt isDraft headRefName baseRefName reviewDecision author{login} labels(first:50){nodes{name}} assignees(first:20){nodes{login}} milestone{title} \
+additions deletions changedFiles files(first:100){nodes{path additions deletions changeType}} \
 reviewRequests(first:20){totalCount nodes{requestedReviewer{... on User{login} ... on Team{name}}}} reviews(first:50){nodes{author{login __typename} state createdAt body}} comments(first:100){nodes{author{login __typename} createdAt body}}}}}}";
 
 fn fetch_item_sync(repo: &str, number: u64) -> Result<ItemDoc> {
@@ -576,6 +597,23 @@ fn parse_item(v: &Value, repo: &str, number: u64) -> Result<ItemDoc> {
         updated: date(&it["updatedAt"]),
         url: it["url"].as_str().unwrap_or("").into(),
         comments: comments.into_iter().map(|(_, c)| c).collect(),
+        file_changes: if is_pr { parse_file_changes(it) } else { None },
+    })
+}
+
+fn parse_file_changes(it: &Value) -> Option<FileChanges> {
+    Some(FileChanges {
+        total: it["changedFiles"].as_u64()?,
+        additions: it["additions"].as_u64()?,
+        deletions: it["deletions"].as_u64()?,
+        files: it["files"]["nodes"].as_array().into_iter().flatten().filter_map(|file| {
+            Some(ChangedFile {
+                path: file["path"].as_str()?.into(),
+                additions: file["additions"].as_u64().unwrap_or(0),
+                deletions: file["deletions"].as_u64().unwrap_or(0),
+                change_type: file["changeType"].as_str().unwrap_or("").into(),
+            })
+        }).collect(),
     })
 }
 
@@ -780,6 +818,38 @@ pub fn apply_field(doc: &mut ItemDoc, field: &str, value: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pr_file_statistics_parse_and_survive_cache_roundtrip() {
+        let response = serde_json::json!({"data": {"repository": {"issueOrPullRequest": {
+            "__typename": "PullRequest", "changedFiles": 142, "additions": 547, "deletions": 937,
+            "files": {"nodes": [
+                {"path": "src/new.rs", "changeType": "ADDED", "additions": 57, "deletions": 0},
+                {"path": "old.rs", "changeType": "DELETED", "additions": 0, "deletions": 48},
+                {"path": "renamed.rs", "changeType": "RENAMED", "additions": 0, "deletions": 0}
+            ]}
+        }}}});
+        let doc = parse_item(&response, "o/r", 7).unwrap();
+        let mut cached = serde_json::to_value(&doc).unwrap();
+        let restored: ItemDoc = serde_json::from_value(cached.clone()).unwrap();
+        let stats = restored.file_changes.unwrap();
+        assert_eq!((stats.total, stats.additions, stats.deletions), (142, 547, 937));
+        assert_eq!(stats.files.len(), 3);
+        assert_eq!(stats.files[0].path, "src/new.rs");
+        assert_eq!(stats.files[0].additions, 57);
+        assert_eq!(stats.files[1].deletions, 48);
+        assert_eq!(stats.files[2].change_type, "RENAMED");
+        cached.as_object_mut().unwrap().remove("file_changes");
+        assert!(serde_json::from_value::<ItemDoc>(cached).unwrap().file_changes.is_none());
+
+        let mut issue = response.clone();
+        issue["data"]["repository"]["issueOrPullRequest"]["__typename"] = "Issue".into();
+        assert!(parse_item(&issue, "o/r", 7).unwrap().file_changes.is_none());
+        let unavailable = serde_json::json!({"changedFiles": 142, "additions": 547, "deletions": 937, "files": null});
+        let stats = parse_file_changes(&unavailable).unwrap();
+        assert_eq!(stats.total, 142);
+        assert!(stats.files.is_empty());
+    }
 
     #[test]
     fn comment_and_review_bot_identity_survives_cache_roundtrip() {

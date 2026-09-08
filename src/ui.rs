@@ -290,7 +290,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
 fn draw_item(f: &mut Frame, app: &mut App, area: Rect) {
     let Some(Pane::Item(p)) = app.stack.last_mut() else { return };
     p.viewport = area.height.saturating_sub(2);
-    let mut lines = p.lines.clone();
+    let mut lines = p.display_lines(area.width.saturating_sub(2) as usize);
     if let Some(link) = p.link_sel.and_then(|i| p.links.get(i))
         && let Some(line) = lines.get_mut(link.line)
     {

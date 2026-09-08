@@ -1,5 +1,6 @@
 mod app;
 mod backend;
+mod files;
 mod md;
 mod ui;
 mod upgrade;

@@ -37,6 +37,13 @@ Repo picker:
   by default. Their author, date, and review status stay visible. Press `x` to
   expand or collapse all long bot comments on the current page; short bot comments
   and human comments stay visible.
+- PR pages show a changed-files tree above the description, with total files,
+  additions, and deletions in the section header. Directories with a single child
+  fold into the path; each file shows a colored change type and aligned `+added`
+  and `−deleted` counts. Types are `A` added, `M` modified, `D` deleted, `R` renamed,
+  `C` copied, and `T` type changed. Long paths shorten to fit the terminal and
+  remain searchable with `/`. The tree shows the first 100 files, followed by
+  `… N more files` for larger PRs; totals always cover the whole PR.
 - PR tables include a colored review status: needs review, changes requested, or approved
   (`—` when GitHub has no review decision or request). `V` on a PR opens the review
   picker: comment, approve, or request changes. Write the message in `$VISUAL`/`$EDITOR`,

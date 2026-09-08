@@ -5,6 +5,7 @@ use crate::backend::{
     ListDoc, Msg, ReviewKind, SearchHit, COLUMNS, PR_COLUMNS,
 };
 use crate::md::{self, Target};
+use crate::files::FileTree;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use edtui::{EditorEventHandler, EditorState, Lines};
 use ratatui::style::{Color, Style};
@@ -41,6 +42,8 @@ pub struct ItemView {
     pub msel: usize,
     pub show_long_bot_comments: bool,
     comment_lines: Vec<usize>, // comment header positions, used to preserve scroll when toggling
+    file_tree: Option<FileTree>,
+    file_tree_start: usize,
 }
 
 impl ItemView {
@@ -62,6 +65,8 @@ impl ItemView {
             msel: 0,
             show_long_bot_comments: false,
             comment_lines: Vec::new(),
+            file_tree: None,
+            file_tree_start: 0,
         }
     }
 
@@ -120,6 +125,12 @@ impl ItemView {
             })
             .collect();
         lines.push(Line::default());
+        self.file_tree = doc.file_changes.as_ref().filter(|_| doc.is_pr).map(FileTree::new);
+        self.file_tree_start = lines.len();
+        if let Some(tree) = &self.file_tree {
+            lines.extend(tree.lines(usize::MAX));
+            lines.push(Line::default());
+        }
         let mut links = Vec::new();
         let mut append = |md_text: &str, lines: &mut Vec<Line<'static>>| {
             let rendered = md::render(md_text);
@@ -163,6 +174,17 @@ impl ItemView {
             self.link_sel = None;
         }
         self.recompute_matches();
+    }
+
+    /// Keep full file paths searchable while fitting each tree row to the viewport.
+    pub fn display_lines(&self, width: usize) -> Vec<Line<'static>> {
+        let mut lines = self.lines.clone();
+        if let Some(tree) = &self.file_tree {
+            for (line, rendered) in lines[self.file_tree_start..].iter_mut().zip(tree.lines(width)) {
+                *line = rendered;
+            }
+        }
+        lines
     }
 
     fn toggle_bot_comments(&mut self, doc: &ItemDoc) {
@@ -1696,6 +1718,52 @@ mod tests {
 
     fn item_text(view: &ItemView) -> String {
         view.lines.iter().map(|line| line.to_string()).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn file_tree_keeps_search_links_and_comment_offsets_when_resized() {
+        use crate::backend::{ChangedFile, FileChanges};
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut app = review_app(true);
+        let doc = app.cache.items.get_mut("o/r#7").unwrap();
+        doc.body = "[Description link](https://example.com/body)".into();
+        doc.comments = vec![comment("review-app", true, format!("{}\n[Bot link](https://example.com/bot)", "Detail\n".repeat(11)))];
+        doc.file_changes = Some(FileChanges {
+            total: 1, additions: 123, deletions: 42,
+            files: vec![ChangedFile {
+                path: "src/a_very_long_file_name_that_ends_with_searchable.rs".into(),
+                change_type: "MODIFIED".into(), additions: 123, deletions: 42,
+            }],
+        });
+        let Some(Pane::Item(view)) = app.stack.last_mut() else { unreachable!() };
+        view.find = "searchable.rs".into();
+        view.set_doc(doc);
+        assert_eq!(view.matches.len(), 1);
+        assert!(view.matches[0] < view.links[0].line);
+        for width in [80, 40, 20, 1, 0] {
+            let lines = view.display_lines(width);
+            assert_eq!(lines.len(), view.lines.len());
+            assert!(lines[view.links[0].line].to_string().contains("Description link"));
+            assert!(lines[view.comment_lines[0]].to_string().contains("review-app"));
+        }
+        view.find.clear();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+        assert!(text.contains("Files changed: 1   +123 −42"));
+        app.on_key(key(KeyCode::Char('x')));
+        let Some(Pane::Item(view)) = app.stack.last() else { unreachable!() };
+        let lines = view.display_lines(40);
+        assert_eq!(view.links.len(), 2);
+        assert!(lines[view.links[1].line].to_string().contains("Bot link"));
+
+        let doc = app.cache.items.get_mut("o/r#7").unwrap();
+        doc.is_pr = false;
+        let Some(Pane::Item(view)) = app.stack.last_mut() else { unreachable!() };
+        view.set_doc(doc);
+        assert!(!item_text(view).contains("Files changed:"));
     }
 
     #[test]
